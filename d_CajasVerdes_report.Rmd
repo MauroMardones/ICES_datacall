@@ -278,74 +278,10 @@ and catch is applied **before** the workflow, in
 ```{r flow-data}
 nTr <- if (nrow(vj)) nrow(vj) else NA
 sh  <- function(v, k) if (nrow(vj)) pct(sum(vj[[v]] %in% k), nTr) else NA_real_
-st  <- c(D = "In Einar's flow, done", A = "Added by us",
-         N = "Possible with these data, not done", X = "Not in the data")
-box <- function(row, col, title, sub, status, share = NA)
-  data.table(row = row, col = col, title = title, sub = sub, status = st[status], share = share)
-flow <- rbindlist(list(
-  box(1, 1, "Logbook", "declared trip", "X"),
-  box(1, 2, "Landing T2", "sales note", "N"),
-  box(1, 3, "Voyage", "from the track", "N"),
-  box(1, 4, "Vessel-day", "FT_REF", "A", 100),
-  box(1, 5, "None", "kept, labelled", "N"),
-  box(2, 1, "Haul t1-t4", "logbook", "X"),
-  box(2, 2, "Haul", "positions", "X"),
-  box(2, 3, "Period x area", "day to month", "X"),
-  box(2, 4, "Trip", "one record", "D", 100),
-  box(3, 1, "Logbook", "gear", "X"),
-  box(3, 2, "Landing", "sales note", "D", sh("gear_basis", "landing")),
-  box(3, 3, "Main gear", "vessel, month/year", "A", sh("gear_basis", c("dominant_month", "dominant_year"))),
-  box(3, 4, "Licence", "gear register", "N"),
-  box(3, 5, "Predicted", "from the track", "N"),
-  box(4, 1, "Haul window", "t1-t4", "X"),
-  box(4, 2, "Phases", "dense track", "N"),
-  box(4, 3, "Track model", "automatic, HMD", "D", sh("LE_GEAR", "HMD")),
-  box(4, 4, "Speed range", "FPO", "D", sh("LE_GEAR", "FPO")),
-  box(5, 1, "Swept area", "HMD only", "D"),
-  box(5, 2, "Pots x soak", "FPO pressure", "N"),
-  box(5, 3, "kW-hours", "engine kW", "D"),
-  box(5, 4, "Hours", "ping intervals", "D"),
-  box(6, 1, "Haul", "logbook catch", "X"),
-  box(6, 2, "Period x area", "logbook catch", "X"),
-  box(6, 3, "Landing", "same/next day", "D",
-      sh("catch_basis", c("landing_same_day", "landing_same_and_next_day", "landing_next_day"))),
-  box(6, 4, "By species", "+ metier L6", "A"),
-  box(6, 5, "None", "effort only", "D", sh("catch_basis", "none"))
-))
-flow[, `:=`(xmin = col - 0.46, xmax = col + 0.46, ymin = -row - 0.40, ymax = -row + 0.40)]
-flow[, label := paste0(title, "\n", sub, ifelse(is.na(share), "", paste0("\n", share, "% of trips")))]
-bottom <- data.table(xmin = c(0.54, 3.04), xmax = c(2.96, 5.46), ymin = -7.85, ymax = -7.25,
-                     label = c("Every ping kept and labelled", "Basis saved per trip (cv_nv_viajes)"),
-                     status = st[c("N", "A")])
-steps <- data.table(row = 1:6, label = c("1. Trip", "2. Logbook record", "3. Gear",
-                                         "4. Fishing?", "5. Effort, pressure", "6. Catch and value"))
-flow[, status := factor(status, levels = st)]
-bottom[, status := factor(status, levels = st)]
 ```
 
-```{r fig-flow, fig.cap = "The six steps of the flow (rows) and their sources, best on the left, as described by Hjörleifsson (2026), applied to cajas verdes and sales notes. Grey: sources of the flow used here. Green: sources or outputs added in this work. Red: possible with these data but not done. White, dashed: not present in the data. Percentages: share of trips (2023 and 2024) that took each source.", fig.height = 6.2, out.width = "100%"}
-fillCols <- setNames(c("#D3D1C7", "#C0DD97", "#F7C1C1", "white"), st)
-lineCols <- setNames(c("#5F5E5A", "#3B6D11", "#A32D2D", "grey50"), st)
-ggplot() +
-  geom_rect(data = flow, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax,
-                             fill = status, colour = status, linetype = status), linewidth = 0.35) +
-  geom_text(data = flow, aes((xmin + xmax) / 2, (ymin + ymax) / 2, label = label),
-            size = 2.3, lineheight = 0.9) +
-  geom_rect(data = bottom, aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax,
-                               fill = status, colour = status, linetype = status), linewidth = 0.35) +
-  geom_text(data = bottom, aes((xmin + xmax) / 2, (ymin + ymax) / 2, label = label), size = 2.6) +
-  geom_text(data = steps, aes(0.45, -row, label = label), hjust = 1, size = 2.8, fontface = "bold") +
-  annotate("text", x = 0.45, y = -7.55, label = "Whole flow", hjust = 1, size = 2.8, fontface = "bold") +
-  annotate("text", x = 0.54, y = -0.35, label = "Sources, best first -> fallback",
-           hjust = 0, size = 2.6, colour = "grey30") +
-  scale_fill_manual(values = fillCols, name = NULL, drop = FALSE) +
-  scale_colour_manual(values = lineCols, name = NULL, drop = FALSE) +
-  scale_linetype_manual(values = setNames(c(1, 1, 1, 2), st), name = NULL, drop = FALSE) +
-  scale_x_continuous(limits = c(-1.1, 5.5), expand = c(0, 0)) +
-  scale_y_continuous(limits = c(-8, -0.2), expand = c(0, 0)) +
-  guides(fill = guide_legend(nrow = 2), colour = guide_legend(nrow = 2), linetype = guide_legend(nrow = 2)) +
-  theme_void(base_size = 9) +
-  theme(legend.position = "bottom", legend.text = element_text(size = 7.5))
+```{r fig-flow, fig.cap = "The six steps of the flow (rows) and their sources, best on the left, as described by Hjörleifsson (2026), applied to cajas verdes and sales notes. Grey: sources of the flow used here. Green: sources or outputs added in this work. Red: possible with these data but not done. White, dashed: not present in the data.", out.width = "100%"}
+knitr::include_graphics("figs/flow_einar_cajasverdes.png")
 ```
 
 Compared with the flow, the green boxes are what this work adds: the trip is
