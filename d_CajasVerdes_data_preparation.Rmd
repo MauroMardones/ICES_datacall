@@ -1,0 +1,757 @@
+---
+title: "Cajas Verdes small-scale fleet data in the ICES VMS & Logbook Data Call workflow"
+subtitle: "Data origin, transformation, assumptions and changes to the ICES base code"
+author: "Mauricio Mardones (IEO-CSIC, Centro Oceanográfico de Cádiz)"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  pdf_document:
+    toc: yes
+    toc_depth: 2
+    number_sections: yes
+    fig_caption: yes
+geometry: margin=2.2cm
+fontsize: 10pt
+header-includes:
+  - \usepackage{booktabs}
+  - \usepackage{longtable}
+  - \usepackage{float}
+---
+
+<!-- Knit from the project root (ICES_datacall/), next to 0_global.R -->
+
+```{r setup, echo = FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE,
+                      comment = NA, fig.pos = "H", out.width = "75%",
+                      fig.align = "center")
+```
+
+```{r setup2}
+library(knitr)
+library(data.table)
+library(ggplot2)
+
+theme_set(theme_bw(base_size = 9) +
+            theme(strip.background = element_rect(fill = "grey90"),
+                  legend.position = "bottom"))
+gearCols <- c(FPO = "#1b7837", HMD = "#d95f02")
+
+# Coastline for maps (maps package; drawn only if available)
+coast <- if (requireNamespace("maps", quietly = TRUE))
+  as.data.table(ggplot2::map_data("world", xlim = c(-9, -4), ylim = c(35, 38.5))) else NULL
+base_map <- function(xlim = c(-7.8, -5.0), ylim = c(35.8, 37.4)) {
+  g <- ggplot()
+  if (!is.null(coast))
+    g <- g + geom_polygon(data = coast, aes(long, lat, group = group),
+                          fill = "grey80", colour = "grey50", linewidth = 0.2)
+  g + geom_vline(xintercept = -5.6, linetype = 2, colour = "grey30") +
+    coord_quickmap(xlim = xlim, ylim = ylim, expand = FALSE) +
+    labs(x = "Longitude", y = "Latitude") +
+    guides(fill = guide_colourbar(barwidth = 14, barheight = 0.6))
+}
+
+options(digits = 4)
+
+# Paths (relative to the project root)
+dataPath <- "Data/"
+outPath  <- "Results/"
+years    <- 2023:2024
+
+# Helper: load an .RData object safely
+load_obj <- function(f) {
+  if (!file.exists(f)) return(NULL)
+  e <- new.env(); load(f, envir = e); get(ls(e)[1], envir = e)
+}
+
+fmt <- function(x) format(x, big.mark = ",", scientific = FALSE)
+
+# Data used in the figures (NULL if not yet produced)
+efl <- rbindlist(lapply(years, function(y) {
+  x <- load_obj(paste0(dataPath, "eflalo_", y, ".RData"))
+  if (is.null(x)) NULL else data.table(Year = y, x)
+}), fill = TRUE)
+tac <- rbindlist(lapply(years, function(y) {
+  x <- load_obj(paste0(dataPath, "tacsat_", y, ".RData"))
+  if (is.null(x)) NULL else data.table(Year = y, x)[, .(Year, SI_LATI, SI_LONG)]
+}))
+act <- rbindlist(lapply(years, function(y) {
+  x <- load_obj(paste0(outPath, "tacsatActivity", y, ".RData"))
+  if (is.null(x)) NULL else data.table(Year = y, as.data.table(x)[, .(LE_GEAR, SI_SP, SI_STATE, SI_LATI, SI_LONG)])
+}))
+tef <- rbindlist(lapply(years, function(y) {
+  x <- load_obj(paste0(outPath, "tacsatEflalo", y, ".RData"))
+  if (is.null(x)) NULL else data.table(Year = y, as.data.table(x)[, .(VE_REF, SI_DATE, LE_GEAR, SI_LATI, SI_LONG, INTV, LE_KG_TOT)])
+}))
+# INTV is in minutes until step 2.5 divides it by 60 (hours); detect the unit per year
+if (nrow(tef)) tef[, INTV_h := if (median(INTV, na.rm = TRUE) > 1) INTV / 60 else INTV, by = Year]
+```
+
+# Purpose and scope
+
+This document records how the Andalusian small-scale fleet tracking data
+("cajas verdes") merged with sales notes were prepared for the
+ICES VMS and Logbook Data Call R workflow (ICES-VMS-and-Logbook-Data-Call,
+version 2.1.0, commit `a844911`). It describes (i) the nature of the source data,
+(ii) how they were transformed into the TACSAT and EFLALO exchange formats
+(Annex 3 of the data call), (iii) the assumptions needed to fit them into a
+workflow designed for logbook/VMS data from larger vessels, and (iv) every change
+made to the ICES base scripts and why.
+
+**Scope of this run**
+
+* Fleets: traps and pots (**FPO**: *nasas* and *trampas*) and hydraulic
+  dredges (**HMD**: *dragas mecanizadas hidráulicas*).
+* Years: **2023 and 2024**.
+* Area: ICES Division **27.9.a** (Gulf of Cádiz). Mediterranean activity is
+  excluded (see Section 4).
+
+# Nature of the source data
+
+## Cajas verdes (green boxes)
+
+The "cajas verdes" are positioning devices installed on Andalusian small-scale
+vessels that are not covered by the EU VMS obligation (most are < 12 m). They
+work like a high-frequency VMS:
+
+* Positions are reported roughly **every 3 minutes** (median interval
+  191 s), much more often than standard VMS (1–2 h).
+* Each record includes position, instantaneous speed and heading, plus
+  derived fields (speed and course computed from consecutive positions,
+  distance, time difference and an in-port flag).
+* Time stamps are stored in **local time (Europe/Madrid)**.
+
+## Sales notes (notas de venta)
+
+Landings come from first-sale notes, not from logbooks. Small-scale vessels
+under 10 m are not required to keep an EU logbook, so the sales note is the only
+record of the catch. Sales notes give:
+
+* sale date, total weight (kg) and total value (EUR) per trip;
+* the number of species sold, but **not the weight by species** in the
+  merged file used here.
+
+## Merged file
+
+Both sources were merged before this work into a single ping-level table,
+`Data/CV_NV_2018_2024_ZE.fst` (`r if (file.exists(paste0(dataPath, "CV_NV_2018_2024_ZE.fst"))) paste(fmt(fst::metadata_fst(paste0(dataPath, "CV_NV_2018_2024_ZE.fst"))$nrOfRows), "rows") else "about 20.3 million rows"`, 2018–2024). Each
+ping carries the trip identifier and the landing totals of its trip.
+
+```{r source-fields}
+src <- data.table(
+  Field = c("FT_REF", "VE_REF", "ANYO", "SI_TIMESTAMP", "SI_LATI / SI_LONG",
+            "SI_SP / SI_HE", "SI_TDIFF", "EN_PUERTO", "LE_MET4", "ARTE",
+            "FECHAVENTA", "TOTAL_KILOS / TOTAL_EUROS", "LE_MET6"),
+  Content = c("Trip identifier = vessel + date (one trip per vessel and day)",
+              "Vessel CFR code (ESP + 9 digits)",
+              "Year",
+              "Ping time, local time (Europe/Madrid)",
+              "Position, decimal degrees",
+              "Instantaneous speed (knots) and heading (degrees)",
+              "Seconds since previous ping",
+              "1 = ping inside a port polygon",
+              "Gear, metier level 4",
+              "Gear name in the national census",
+              "Sale date of the trip",
+              "Trip landings (kg) and value (EUR), repeated on each ping",
+              "Metier level 6 (empty in this file)"))
+kable(src, booktabs = TRUE, caption = "Fields of the merged source file used in this work.")
+```
+
+# Transformation to TACSAT and EFLALO
+
+The conversion is done by `0_cajasverdes_formato.R`, which runs **before**
+`0_global.R`. It reads the `.fst` file, keeps the selected fleets and years, and
+writes `Data/tacsat_YYYY.RData` and `Data/eflalo_YYYY.RData`, with object names
+`tacsat_YYYY` and `eflalo_YYYY`, as `1_eflalo_tacsat_preprocessing.R` expects.
+
+## Comparison with the data call formats
+
+Tables 2 and 3 compare each field required by the data call (Annex 3, TACSAT2
+and EFLALO2 formats) with what the cajas verdes and sales notes provide.
+**Status** is one of: *Direct* (field exists and is copied), *Converted* (exists
+but changes unit, time zone or format), *Derived* (computed from other fields),
+*Assumed* (filled by an assumption, Section 4), *Missing* (not available; left NA).
+
+```{r cmp-tacsat}
+cmpT <- data.table(
+  Field    = c("VE_REF", "VE_COU", "SI_LATI", "SI_LONG", "SI_DATE", "SI_TIME", "SI_SP", "SI_HE"),
+  `Data call format` = c("Vessel ID, 20 char", "ISO 3166-1 alpha-3", "Decimal degrees",
+                         "Decimal degrees", "DD/MM/YYYY", "HH:MM, UTC", "Knots", "Degrees"),
+  `Cajas verdes` = c("VE_REF (CFR)", "not present", "SI_LATI", "SI_LONG",
+                     "SI_TIMESTAMP (POSIXct)", "SI_TIMESTAMP, Europe/Madrid, seconds",
+                     "SI_SP (knots)", "SI_HE (degrees)"),
+  Status = c("Direct", "Assumed (ESP)", "Direct", "Direct", "Converted",
+             "Converted (UTC, minute)", "Direct", "Direct"))
+kable(cmpT, booktabs = TRUE,
+      caption = "TACSAT2 format required by the data call vs. cajas verdes positions.")
+```
+
+```{r cmp-eflalo}
+cmpE <- data.table(
+  Field = c("VE_REF", "VE_FLT", "VE_COU", "VE_LEN", "VE_KW", "VE_TON",
+            "FT_REF", "FT_DCOU / FT_LCOU", "FT_DHAR / FT_LHAR",
+            "FT_DDAT / FT_DTIME", "FT_LDAT / FT_LTIME",
+            "LE_ID", "LE_CDAT", "LE_STIME / LE_ETIME", "LE_SLAT ... LE_ELON",
+            "LE_GEAR", "LE_MSZ", "LE_RECT", "LE_DIV", "LE_MET",
+            "LE_KG_[FAO code]", "LE_EURO_[FAO code]"),
+  `Data call format` = c("Vessel ID", "DCF fleet", "ISO alpha-3", "LOA (m)", "kW", "GT",
+                         "Trip ID", "ISO alpha-3", "UN LOCODE",
+                         "Departure DD/MM/YYYY, HH:MM", "Arrival DD/MM/YYYY, HH:MM",
+                         "Log event ID", "Catch date", "HH:MM (optional)",
+                         "Haul positions (optional)",
+                         "Metier L4 (3 char)", "Mesh (mm)", "ICES rectangle", "ICES division",
+                         "Metier L6", "kg by FAO species", "EUR by FAO species"),
+  `Cajas verdes + sales notes` = c("VE_REF (CFR)", "LE_MET4", "not present",
+                                   "not present", "not present", "not present",
+                                   "FT_REF (vessel + date)", "not present", "not present",
+                                   "first ping of the trip", "last ping of the trip",
+                                   "not present", "FECHAVENTA (sale date)", "not present",
+                                   "not present",
+                                   "LE_MET4", "not present", "from ping positions",
+                                   "from ping positions", "LE_MET6 empty",
+                                   "TOTAL_KILOS (trip total)", "TOTAL_EUROS (trip total)"),
+  Status = c("Direct", "Derived", "Assumed (ESP)", "Missing (EU Fleet Register)",
+             "Missing (EU Fleet Register)", "Missing (EU Fleet Register)",
+             "Direct", "Assumed (ESP)", "Missing (NA)",
+             "Derived (UTC)", "Derived (UTC)",
+             "Derived (FT_REF_1)", "Assumed", "Missing (optional)", "Missing (optional)",
+             "Direct", "Missing (NA)", "Derived", "Derived", "Assumed (by gear)",
+             "Assumed (MZZ)", "Assumed (MZZ)"))
+kable(cmpE, booktabs = TRUE, longtable = TRUE,
+      caption = "EFLALO2 format required by the data call vs. cajas verdes and sales notes.")
+```
+
+```{r cmp-annex}
+cmpA <- data.table(
+  `Annex field` = c("VesselLengthRange", "AverageVesselLength / AveragekW",
+                    "kWFishingHour (VE) / kWFishingDays (LE)",
+                    "FishingHour (VE)", "FishingDays (LE)", "AverageFishingSpeed",
+                    "AverageInterval", "Csquare / ICESrectangle",
+                    "MetierL4 / L5 / L6", "TotWeight / TotValue",
+                    "AverageGearWidth / SweptArea", "Habitat / Depth",
+                    "VMSEnabled", "AnonymizedVesselID / NoDistinctVessels"),
+  `Required` = c("Yes", "Yes", "Yes (VE) / No (LE)", "Yes", "Yes", "Yes", "Yes", "Yes",
+                 "Yes", "Yes / No", "Yes / No", "No", "No", "Yes"),
+  `Can be filled` = c("Only with EU Fleet Register", "Only with EU Fleet Register",
+                      "Only with EU Fleet Register", "Yes (3-min pings)",
+                      "Yes (vessel-days)", "Yes", "Yes (~3 min)", "Yes",
+                      "Yes (L6 assumed by gear)", "Yes (trip totals)",
+                      "HMD: BENTHIS default; FPO: not applicable",
+                      "Yes (workflow layers)", "Yes", "Yes"))
+kable(cmpA, booktabs = TRUE,
+      caption = "Coverage of the Annex 1 (VE) and Annex 2 (LE) submission fields with these data.")
+```
+
+**Summary.** Positions are complete and of higher resolution than standard VMS.
+The main gaps are on the logbook side: vessel characteristics (length, power,
+tonnage), species composition of the landings, mesh size and ports. Vessel
+characteristics are the only gap that blocks required Annex fields, and they can
+be filled from the EU Fleet Register by CFR.
+
+## TACSAT (positions)
+
+* One row per ping, restricted to trips kept in EFLALO.
+* Time converted from Europe/Madrid to **UTC**, truncated to the minute
+  (`SI_DATE` = dd/mm/yyyy, `SI_TIME` = HH:MM).
+* When two pings of one vessel fall in the same minute, only the first is kept.
+  Otherwise `intervalTacsat()` would produce zero-length intervals.
+* `VE_COU` = ESP. `SI_SP` and `SI_HE` are taken directly from the device.
+
+## EFLALO (trips and landings)
+
+One row per trip (`FT_REF`), built from the pings of that trip:
+
+```{r eflalo-map}
+map <- data.table(
+  `EFLALO field` = c("VE_REF", "VE_FLT, LE_GEAR", "VE_COU, FT_DCOU, FT_LCOU",
+                     "FT_DDAT / FT_DTIME", "FT_LDAT / FT_LTIME",
+                     "FT_DHAR, FT_LHAR", "LE_ID", "LE_CDAT", "LE_MET",
+                     "LE_RECT", "LE_DIV", "LE_MSZ", "LE_KG_MZZ / LE_EURO_MZZ",
+                     "VE_LEN, VE_KW, VE_TON"),
+  Source = c("VE_REF (CFR)", "LE_MET4", "\"ESP\"",
+             "First ping of the trip (UTC)", "Last ping of the trip (UTC)",
+             "NA (not available)", "FT_REF + \"_1\" (one log event per trip)",
+             "FECHAVENTA (sale date)",
+             "FPO -> FPO_CEP_>0_0_0; HMD -> HMD_MOL_>0_0_0",
+             "Most frequent ICES rectangle of the at-sea pings in 27.9.a",
+             "27.9.a, or 37.1.1 if most at-sea pings have longitude > -5.6",
+             "NA (passive gear / dredge)",
+             "TOTAL_KILOS / TOTAL_EUROS of the trip",
+             "EU Fleet Register by CFR (pending, see Section 7)"))
+kable(map, booktabs = TRUE, caption = "Origin of each EFLALO field.")
+```
+
+## Records retained
+
+```{r resumen}
+res <- if (file.exists(paste0(dataPath, "cajasverdes_resumen_formato.csv")))
+  fread(paste0(dataPath, "cajasverdes_resumen_formato.csv")) else NULL
+if (!is.null(res)) {
+  r <- res[, .(Year = anio, `Trips (all)` = fmt(viajes_total),
+               `Trips in Mediterranean (excluded)` = fmt(viajes_mediterraneo_excluidos),
+               `Trips in EFLALO` = fmt(viajes_eflalo),
+               FPO = fmt(viajes_FPO), HMD = fmt(viajes_HMD),
+               Vessels = buques, `Landings (t)` = fmt(round(kg_total / 1000, 1)),
+               `TACSAT pings` = fmt(pings_tacsat))]
+  kable(r, booktabs = TRUE, align = "r",
+        caption = "Records produced by 0_cajasverdes_formato.R.")
+}
+```
+
+```{r fig-trips, fig.cap = "Number of trips per month by gear (EFLALO, ICES area 27.9.a only).", fig.height = 3, out.width = "85%"}
+if (nrow(efl)) {
+  d <- efl[, .(Month = as.integer(substr(FT_LDAT, 4, 5)), LE_GEAR, Year)][, .N, by = .(Year, Month, LE_GEAR)]
+  ggplot(d, aes(factor(Month), N, fill = LE_GEAR)) +
+    geom_col(position = "dodge") +
+    facet_wrap(~ Year) +
+    scale_fill_manual(values = gearCols, name = "Gear") +
+    labs(x = "Month", y = "Trips")
+}
+```
+
+```{r fig-landings, fig.cap = "Landings per trip by gear (sales notes). Log scale.", fig.height = 2.8, out.width = "70%"}
+if (nrow(efl)) {
+  ggplot(efl, aes(LE_GEAR, LE_KG_MZZ, fill = LE_GEAR)) +
+    geom_boxplot(outlier.size = 0.3, show.legend = FALSE) +
+    facet_wrap(~ Year) +
+    scale_y_log10(labels = scales::comma) +
+    scale_fill_manual(values = gearCols) +
+    labs(x = NULL, y = "Landings per trip (kg)")
+}
+```
+
+```{r fig-pings, fig.cap = "Density of TACSAT positions given to the workflow (all pings, before cleaning). Dashed line: FAO 27/37 boundary (5 deg 36' W). Coastline is low resolution (maps package).", fig.height = 3.4, out.width = "95%"}
+if (nrow(tac)) {
+  d <- tac[, .(lon = floor(SI_LONG / 0.02) * 0.02 + 0.01,
+               lat = floor(SI_LATI / 0.02) * 0.02 + 0.01, Year)][, .N, by = .(Year, lon, lat)]
+  base_map() +
+    geom_tile(data = d, aes(lon, lat, fill = N)) +
+    facet_wrap(~ Year) +
+    scale_fill_viridis_c(trans = "log10", name = "Pings per 0.02 deg cell")
+}
+```
+
+# Assumptions
+
+The ICES workflow was designed for EU logbook and VMS data. Using it with cajas
+verdes and sales notes requires the assumptions below. They should be read
+together with any product derived from these data.
+
+1. **Trip = vessel-day.** `FT_REF` is defined as vessel + date in the source
+   file. Departure and arrival are taken as the first and last ping of that
+   day, not as declared port times. The median trip lasts about 21 h because the
+   device keeps reporting while the vessel is in port. The workflow removes
+   in-port pings (3 km harbour buffer), so effort is not inflated, but trip
+   duration as such should not be interpreted.
+2. **One log event per trip.** Sales notes have no haul or fishing-operation
+   resolution, so each trip has a single `LE_ID`. Landings are spread over the
+   fishing pings of the trip (`linkEflaloTacsat = "trip"`).
+3. **Sale date = catch date.** `LE_CDAT` is the sale date. More than 99.9% of
+   trips are sold on the day of the last ping.
+4. **Landings not split by species.** Only trip totals are available, so all
+   landings are reported under the generic FAO code **MZZ** (marine fishes
+   n.e.i.). The Annex 1 (VE) and Annex 2 (LE) tables use only total weight
+   and value, so the submitted totals are unaffected. Species-level outputs
+   from this run must not be used.
+5. **Metier level 6 assigned by gear.** `LE_MET6` is empty in the source file.
+   All FPO trips are assigned `FPO_CEP_>0_0_0` (octopus pots) and all HMD trips
+   `HMD_MOL_>0_0_0` (bivalve dredges). Both codes are valid in the RDB-ISSG
+   metier list. FPO trips targeting other species (fish, crustaceans) are
+   therefore misclassified at level 6.
+6. **FPO includes *nasas* and *trampas*.** Both carry `LE_MET4 = FPO` and are
+   treated as one fleet.
+7. **ICES area boundary.** Trips with most at-sea pings east of 5°36'W (the FAO
+   27/37 boundary at the Strait of Gibraltar) are classified as Mediterranean
+   (`LE_DIV = 37.1.1`) and excluded. This removes about 83% of the FPO trips,
+   which mostly operate from Mediterranean ports. The workflow also removes
+   individual pings outside its ICES-area polygons.
+8. **Mesh size and harbours unknown.** `LE_MSZ`, `FT_DHAR` and `FT_LHAR` are NA.
+   They are not used to build the annex tables.
+9. **Time zone.** All times are converted to UTC, as required by TACSAT/EFLALO.
+
+# Issues found when moving cajas verdes data into the data call workflow
+
+The ICES workflow assumes EU logbooks (one record per haul or fishing day, with
+species-level catch, vessel details and declared ports) and EU VMS (one position
+every 1–2 hours, vessels of 12 m or more). Cajas verdes and sales notes differ on
+almost every one of these points. The issues below were found in this exercise.
+They are grouped by stage, and for each one the consequence and the solution
+adopted are stated.
+
+## Data structure and identifiers
+
+* **No logbook; sales notes act as EFLALO.** The fleet is not obliged to keep an
+  EU logbook. Landings come from first-sale notes, which record what was sold,
+  when and for how much, not where or how it was caught. The EFLALO "log event"
+  (`LE_*`) fields therefore have no direct source and were built from the
+  positions (rectangle, division) or by assumption (metier, catch date).
+* **Trips are not declared.** There is no departure or arrival declaration. The
+  trip identifier in the source file is vessel + calendar day, so `FT_DDAT/TIME`
+  and `FT_LDAT/TIME` were taken from the first and last ping of the day. The
+  device keeps reporting in port, so trips appear to last about 20 h and start
+  around midnight. Trip duration is not meaningful. Effort is protected only
+  because the workflow later removes in-port pings.
+* **One log event per trip.** Without haul-level information, `LE_ID` is
+  `FT_REF_1`, and landings are spread evenly over all fishing pings of the trip
+  (`linkEflaloTacsat = "trip"`). Spatial allocation of landings follows the
+  fishing pings, not the actual catch location.
+* **Merged, ping-level source file.** The source is a single 20-million-row
+  ping table in `.fst` format, with trip totals repeated on every ping. It had to
+  be split into two tables (TACSAT and EFLALO) and aggregated back to one row
+  per trip. `.fst` needs the `fst` package, which is not part of the workflow.
+* **Object and file naming is strict.** Step 1 expects `Data/tacsat_YYYY.RData`
+  and `Data/eflalo_YYYY.RData` containing objects named exactly `tacsat_YYYY` and
+  `eflalo_YYYY`, one per year in `yearsToSubmit`. Any year in that vector without
+  its files stops the run.
+
+## Time and position
+
+* **Local time instead of UTC.** Cajas verdes timestamps are in Europe/Madrid
+  local time (UTC+1/+2 with daylight saving). TACSAT and EFLALO require UTC. All
+  times were converted, which moves some pings and trip boundaries to the
+  previous calendar day.
+* **Second resolution.** TACSAT stores `HH:MM`. Truncating to the minute created
+  duplicate vessel-minute pairs, which were reduced to one ping. Without that,
+  `intervalTacsat()` produces zero-length intervals.
+* **Reporting frequency 20–40 times higher than VMS.** Pings arrive every
+  ~3 minutes. The default pseudo-duplicate threshold (`intThres = 5` min) would
+  delete about 98% of the positions in step 1. It had to be lowered to 1 min.
+  The higher resolution also means 10–20 times more rows than for an equivalent
+  VMS fleet, with longer run times and larger memory use.
+* **Pings on land and in estuaries.** 7–13% of the pings fall outside the ICES
+  area polygons used in step 1: east of the Strait, but also over land, in
+  marinas and in inner estuaries such as the Guadalquivir. They are removed, but
+  some of them may be real activity in coastal waters that the polygons do not
+  cover.
+* **Long periods in port.** About 20% of the remaining pings lie within the
+  3 km harbour buffer and are removed. For small vessels that fish close to
+  port, the 3 km buffer may also remove some genuine fishing pings.
+
+## Area of activity
+
+* **Mediterranean activity mixed with Atlantic activity.** The same fleets work
+  on both sides of the Strait of Gibraltar. ICES only covers FAO area 27, so trips
+  with most at-sea pings east of 5°36'W were excluded. This removes about 83% of
+  the FPO trips, so the FPO fleet in the data call is a small fraction of the
+  real fleet.
+* **Rectangles not recorded.** `LE_RECT` and `LE_DIV` are not in the sales notes.
+  They were assigned from the most frequent rectangle of the at-sea pings. Trips
+  that cross rectangles are attributed to only one of them in the LE table.
+
+## Vessel characteristics
+
+* **No vessel length, power or tonnage.** The source file has only the CFR code.
+  `VE_LEN`, `VE_KW` and `VE_TON` are needed for `VesselLengthRange`,
+  `AverageVesselLength`, `AveragekW`, `kWFishingHour` and `kWFishingDays`, and for
+  the gear-width model. They must be joined from the EU Fleet Register by CFR,
+  and the register keeps a history of events, so the record valid in each year
+  must be selected. Until this is done, `VE_KW` is set to 0 by the workflow and
+  kW-based effort is zero.
+* **Fleet segmentation.** `VE_FLT` was set to the gear (FPO, HMD), not to a DCF
+  fleet segment.
+
+## Catch information
+
+* **No species breakdown.** The merged sales notes give only total kg and EUR per
+  trip. All landings were reported as FAO code MZZ. Annex totals are correct,
+  but species-based checks are meaningless: the outlier check in step 1 and any
+  species-level product.
+* **Metier level 6 missing.** `LE_MET6` is empty. Metiers were assigned by gear
+  (`FPO_CEP_>0_0_0`, `HMD_MOL_>0_0_0`). Without species data, FPO trips that
+  target fish or crustaceans cannot be separated from octopus trips.
+* **Sale date instead of catch date.** `LE_CDAT` is the sale date. It coincides
+  with the trip day in more than 99.9% of trips, but not by definition.
+* **Mesh size and ports unknown.** `LE_MSZ`, `FT_DHAR` and `FT_LHAR` are NA.
+
+## Fishing activity definition
+
+* **Automatic detection fails for hydraulic dredges.** HMD is in the default
+  `autoDetectionGears`. The mixture model classified the full speed range as
+  fishing (up to 22 kn in 2023 and 14 kn in 2024), although the speed
+  histograms show clearly separated fishing (~1–3 kn) and steaming (~7–9 kn)
+  modes. Fishing hours are overestimated and spread over transit routes unless
+  fixed, gear-specific thresholds are used.
+* **Passive gears were never classified as fishing (workflow bug).** For gears
+  outside `autoDetectionGears` (FPO), the fixed-speed rule in step 2 never ran
+  because of a typo (`LE_l5MET`) and two column mismatches. Every FPO ping was
+  set to "steaming" and the fleet disappeared from the outputs. The bug was
+  fixed (Section 6).
+* **Speed rule is not ideal for pots.** Pot fishing is detected by speed only
+  (default 1–6 kn). Hauling and setting happen at low and variable speeds, and
+  pots soak unattended, so "fishing hours" for FPO measure time spent working the
+  gear, not fishing time.
+* **Gear width.** HMD maps to the BENTHIS metier `DRB_MOL`. Without vessel length
+  the default BENTHIS width (17 m) is used for all vessels. FPO has no BENTHIS
+  equivalent, so it has no swept area, which is correct for a passive gear.
+
+## Workflow and software issues
+
+* **Single-species EFLALO breaks step 2.** `rowSums()` on one `LE_KG_*` column
+  fails because base R drops the data frame to a vector (fixed with
+  `drop = FALSE`).
+* **External services are required at run time.** The workflow downloads the
+  metier list (GitHub), the BENTHIS gear-width table (ICES API) and the habitat
+  and bathymetry layers (ICES SharePoint, 1.2 GB). During this run the
+  SharePoint download was truncated without warning (no size check) and the ICES
+  API returned HTTP 500. A size check and a local copy of the BENTHIS table were
+  needed.
+* **Missing package dependencies.** `icesVMS` failed to load because its
+  dependency `sqldf` was not installed. The resulting error ("could not find
+  function get_benthis_parameters") does not point to the cause.
+* **Step 2 is not idempotent.** Its second loop reloads `tacsatEflalo`, divides
+  `INTV` by 60 and saves over the same file. Re-running only that loop converts
+  minutes to hours twice. An interrupted run leaves some years in minutes and
+  others in hours, so step 2 must always be re-run in full.
+* **Functions live in the session.** All helper functions (`trip_assign()`,
+  `add_gearwidth()`, ...) are defined in `0_global.R`. Restarting R between
+  steps produces "could not find function" errors until `0_global.R` is sourced
+  again. That script also re-extracts the 1.2 GB habitat archive on every run.
+
+# Changes to the ICES base code
+
+The ICES scripts (`0_global.R`, `1_eflalo_tacsat_preprocessing.R`,
+`2_eflalo_tacsat_analysis.R`, `3_data_submission.R`) are a community-maintained
+reference implementation. They should stay as close as possible to the official
+version so that results are comparable between countries and new releases can
+be merged without conflicts. The repository was copied without modification
+(`ORIGEN.txt`).
+
+The few changes below were unavoidable for these data. Each one is minimal and
+marked in the code with a comment, and the original value is kept in the comment.
+
+```{r changes}
+chg <- data.table(
+  Location = c("0_global.R, l. 71", "0_global.R, l. 76",
+               "0_global.R, add_gearwidth()",
+               "2_eflalo_tacsat_analysis.R, l. 491/493",
+               "2_eflalo_tacsat_analysis.R, speed rule"),
+  Original = c("intThres <- 5", "yearsToSubmit <- c(2009:2025)",
+               "get_benthis_parameters() only",
+               "eflalo[, idx_kg]", "LE_l5MET / speedarr$LE_GEAR"),
+  Changed  = c("intThres <- 1", "yearsToSubmit <- c(2023:2024)",
+               "local copy if the API fails",
+               "eflalo[, idx_kg, drop = FALSE]", "LE_L5MET"),
+  Type = c("Setting", "Setting", "Robustness", "Bug fix", "Bug fix"))
+kable(chg, booktabs = TRUE, caption = "Changes made to the ICES base scripts.")
+```
+
+**`intThres` (setting).** Pings closer in time than `intThres` minutes are
+removed as pseudo-duplicates (step 1.2.4). The default of 5 min assumes VMS
+reporting every 1–2 h. Cajas verdes report every ~3 min, and 98% of the
+intervals are shorter than 5 min, so the default would delete almost all
+positions. With 1 min only genuine duplicates are removed (one ping in 2024).
+
+**`yearsToSubmit` (setting).** This parameter is meant to be set by each user.
+Only 2023 and 2024 were prepared. With the default, step 1 stops when it cannot
+find `tacsat_2009.RData`.
+
+**`drop = FALSE` (bug fix).** Step 2 sums all `LE_KG_*` and `LE_EURO_*` columns
+with `rowSums(eflalo[, idx_kg])`. When there is only one species column (here
+`LE_KG_MZZ`), base R drops the data frame to a vector and `rowSums()` fails
+("'x' must be an array of at least two dimensions"). Adding `drop = FALSE`
+returns the same result for any number of species, so the fix does not change
+the output for other users. It should be reported to the workflow maintainers
+(accessions@ices.dk / WGSFD).
+
+**Speed rule for non-automatic gears (bug fix).** Gears that are not in
+`autoDetectionGears` (here FPO) are classified as fishing when their speed falls
+inside a fixed range (`speedarr`). In version 2.1.0 this block had three errors:
+it read `nonsubTacsat$LE_l5MET` (lower-case "l", a column that does not exist, so
+the loop never ran); it looked up `speedarr$LE_GEAR` (the column is
+`LE_L5MET`); and it compared the gear code with a level-5 metier. As a result
+**no ping of any non-automatic gear was ever set to fishing**, and the whole FPO
+fleet disappeared from the effort and landings outputs. The block now uses
+`LE_L5MET` throughout, and the original lines are kept as comments. The error is
+still present in the latest official commit (`a844911`, 5 October 2026) and
+affects every country using passive gears, so it should be reported to the
+maintainers.
+
+**Gear width parameters (robustness).** `add_gearwidth()` downloads the BENTHIS
+gear-width parameters from the ICES API (`taf.ices.dk/vms/api/gearwidths`).
+During this run the server returned HTTP 500 and the step failed. A fallback was
+added: if the API does not return a table, the function reads
+`resources/benthis_gearwidths_sfdSAR.csv`. That file holds the same table
+(14 BENTHIS metiers), extracted from the README of the ICES `sfdSAR` package. When
+the API works, nothing changes. HMD maps to the BENTHIS metier `DRB_MOL`. FPO has
+no BENTHIS equivalent, so it gets no gear width and no swept area, which is
+correct for a passive gear.
+
+No other line of the base code was changed. All data-specific handling is in
+`0_cajasverdes_formato.R`.
+
+# Results of pre-processing (step 1)
+
+```{r remrecs, results = "asis"}
+for (yr in years) {
+  rt <- load_obj(paste0(outPath, "remrecsTacsat", yr, ".RData"))
+  re <- load_obj(paste0(outPath, "remrecsEflalo", yr, ".RData"))
+  if (!is.null(rt)) {
+    d <- data.table(Step = rownames(rt), Rows = fmt(as.numeric(rt[, 1])),
+                    `% remaining` = sub("%", "", rt[, 2]))
+    print(kable(d, booktabs = TRUE, align = c("l", "r", "r"),
+                caption = paste("TACSAT records remaining after each cleaning step,", yr)))
+  }
+  if (!is.null(re)) {
+    d <- data.table(Step = rownames(re), Rows = fmt(as.numeric(re[, 1])),
+                    `% remaining` = sub("%", "", re[, 2]))
+    print(kable(d, booktabs = TRUE, align = c("l", "r", "r"),
+                caption = paste("EFLALO records remaining after each cleaning step,", yr)))
+  }
+  cat("\n")
+}
+```
+
+```{r fig-remrecs, fig.cap = "TACSAT records remaining after each cleaning step (step 1).", fig.height = 2.6, out.width = "75%"}
+rr <- rbindlist(lapply(years, function(yr) {
+  rt <- load_obj(paste0(outPath, "remrecsTacsat", yr, ".RData"))
+  if (is.null(rt)) return(NULL)
+  data.table(Year = factor(yr), Step = factor(rownames(rt), levels = rownames(rt)),
+             Pct = as.numeric(sub("%", "", rt[, 2])))
+}))
+if (nrow(rr))
+  ggplot(rr, aes(Step, Pct, fill = Year)) +
+    geom_col(position = "dodge") +
+    scale_fill_grey(start = 0.4, end = 0.75) +
+    coord_cartesian(ylim = c(0, 100)) +
+    labs(x = NULL, y = "% of pings remaining") +
+    theme(axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
+No trips were removed by the EFLALO checks: there are no duplicates, impossible
+times, overlapping trips or invalid metiers. The two TACSAT losses are expected:
+
+* **outside ICES area** (7–13%): pings east of the Strait or over land and inner
+  estuaries outside the ICES polygons;
+* **harbour** (about 20%): pings within 3 km of a port, where the vessels spend
+  several hours a day.
+
+# Fishing activity and effort (step 2)
+
+`HMD` is included in the workflow's `autoDetectionGears`, so its fishing pings
+are identified by fitting a mixture of normal distributions to the speed
+profile. `FPO` is not in that list. It uses the fixed speed range in `speedarr`
+(default 1–6 knots), which only works after the bug fix described in Section 6.
+
+```{r speeds}
+f <- paste0(outPath, "fishing_speeds_by_metier_and_year.txt")
+if (file.exists(f)) {
+  l <- readLines(f)
+  yrs <- sub("Year: ", "", grep("^Year", l, value = TRUE))
+  sp  <- grep("^\"", l, value = TRUE)
+  s <- rbindlist(lapply(seq_along(sp), function(i) {
+    p <- strsplit(sp[i], "\t")[[1]]
+    data.table(Year = yrs[i], Metier = gsub("\"", "", p[1]),
+               `Min speed (kn)` = round(as.numeric(p[2]), 2),
+               `Max speed (kn)` = round(as.numeric(p[3]), 2))
+  }))
+  kable(unique(s), booktabs = TRUE,
+        caption = "Fishing speed range of the automatic detection (HMD).")
+}
+```
+
+```{r fig-speed, fig.cap = "Speed of the pings after cleaning, by gear and year, coloured by the activity state assigned in step 2 (f = fishing, s = steaming / not fishing).", fig.height = 3.6, out.width = "90%"}
+if (nrow(act)) {
+  ggplot(act[SI_SP <= 15], aes(SI_SP, fill = SI_STATE)) +
+    geom_histogram(binwidth = 0.25, boundary = 0) +
+    facet_grid(LE_GEAR ~ Year, scales = "free_y") +
+    scale_fill_manual(values = c(f = "#2166ac", s = "grey70"), name = "State") +
+    scale_y_continuous(labels = scales::comma) +
+    labs(x = "Speed (knots)", y = "Pings")
+}
+```
+
+```{r state-table}
+if (nrow(act)) {
+  st <- act[, .(Pings = .N, `Fishing (%)` = round(100 * mean(SI_STATE == "f"), 1),
+                `Median fishing speed (kn)` = round(median(SI_SP[SI_STATE == "f"]), 2),
+                `Max fishing speed (kn)` = if (any(SI_STATE == "f")) round(max(SI_SP[SI_STATE == "f"]), 1) else NA_real_),
+            by = .(Year, Gear = LE_GEAR)][order(Year, Gear)]
+  kable(st, booktabs = TRUE, caption = "Activity states assigned in step 2.")
+}
+```
+
+Both gears show two clear speed modes: **fishing** at low speed (about
+0.5–4 kn) and **steaming** at 6–10 kn. If the automatic detection for HMD
+classifies the whole speed range as fishing (maximum fishing speed well above
+4 kn in the table), fishing hours are overestimated and spread over transit
+routes.
+
+**Recommendation.** Remove `HMD` from `autoDetectionGears` in `0_global.R` and
+set fixed, gear-specific ranges in `speedarr` in `2_eflalo_tacsat_analysis.R`
+(after the default `speedarr$min` / `speedarr$max` lines). Base them on the
+low-speed mode of the histograms and on knowledge of the fleets, for example:
+
+```r
+speedarr[speedarr$LE_L5MET == "HMD_MOL", c("min", "max")] <- c(0.5, 3)
+speedarr[speedarr$LE_L5MET == "FPO_CEP", c("min", "max")] <- c(0.5, 4)
+```
+
+These values are indicative and must be checked by the fleet experts before
+submission.
+
+```{r fig-effort, fig.cap = "Fishing effort (hours) by 0.05 deg cell, gear and year, from the fishing pings with landings attached (tacsatEflalo).", fig.height = 4.6, out.width = "95%"}
+if (nrow(tef)) {
+  d <- tef[, .(Hours = sum(INTV_h, na.rm = TRUE)),
+           by = .(Year, LE_GEAR, lon = floor(SI_LONG / 0.05) * 0.05 + 0.025,
+                  lat = floor(SI_LATI / 0.05) * 0.05 + 0.025)]
+  base_map(xlim = c(-7.6, -5.9), ylim = c(36.5, 37.3)) +
+    geom_tile(data = d, aes(lon, lat, fill = Hours)) +
+    facet_grid(LE_GEAR ~ Year) +
+    scale_fill_viridis_c(trans = "log10", option = "magma", direction = -1,
+                         name = "Fishing hours", labels = scales::comma)
+}
+```
+
+```{r fig-landmap, fig.cap = "Landings (t) distributed over fishing pings, by 0.05 deg cell, gear and year.", fig.height = 4.6, out.width = "95%"}
+if (nrow(tef)) {
+  d <- tef[, .(Tonnes = sum(LE_KG_TOT, na.rm = TRUE) / 1000),
+           by = .(Year, LE_GEAR, lon = floor(SI_LONG / 0.05) * 0.05 + 0.025,
+                  lat = floor(SI_LATI / 0.05) * 0.05 + 0.025)]
+  base_map(xlim = c(-7.6, -5.9), ylim = c(36.5, 37.3)) +
+    geom_tile(data = d[Tonnes > 0], aes(lon, lat, fill = Tonnes)) +
+    facet_grid(LE_GEAR ~ Year) +
+    scale_fill_viridis_c(trans = "log10", name = "Landings (t)", labels = scales::comma)
+}
+```
+
+```{r effort-table}
+if (nrow(tef)) {
+  et <- tef[, .(`Fishing pings` = fmt(.N), Vessels = uniqueN(VE_REF),
+                `Fishing days` = fmt(uniqueN(paste(VE_REF, SI_DATE))),
+                `Fishing hours` = fmt(round(sum(INTV_h, na.rm = TRUE))),
+                `Hours per day` = round(sum(INTV_h, na.rm = TRUE) / uniqueN(paste(VE_REF, SI_DATE)), 1),
+                `Landings (t)` = fmt(round(sum(LE_KG_TOT, na.rm = TRUE) / 1000, 1))),
+            by = .(Year, Gear = LE_GEAR)][order(Year, Gear)]
+  kable(et, booktabs = TRUE, align = c("l", "l", "r", "r", "r", "r", "r", "r"),
+        caption = "Effort and landings in tacsatEflalo (input to the Annex 1 table).")
+}
+```
+
+# Pending issues before submission
+
+1. **Vessel characteristics.** `VE_LEN`, `VE_KW` and `VE_TON` are still NA.
+   Without them `VesselLengthRange`, `AverageVesselLength`, `AveragekW`,
+   `kWFishingHour` and `kWFishingDays` cannot be computed. To fill them, export
+   the EU Fleet Register for Spain to `Data/EU_fleet_register_ESP.csv`
+   (matched by CFR) and re-run `0_cajasverdes_formato.R`.
+2. **Fishing speed thresholds.** Apply and justify the gear-specific
+   `speedarr` ranges (Section 8).
+3. **Species composition.** If sales notes by species become available,
+   replace `LE_KG_MZZ` with real FAO codes. Only the species columns change.
+4. **Metier level 6.** If target species are available, refine
+   `FPO_CEP_>0_0_0` for trips not targeting octopus.
+
+# Reproducibility
+
+Run from the project root, in this order:
+
+1. `0_cajasverdes_formato.R`: source `.fst` to TACSAT/EFLALO (Annex 3).
+2. `0_global.R`: settings, packages, habitat and bathymetry layers.
+3. `1_eflalo_tacsat_preprocessing.R`: cleaning.
+4. `2_eflalo_tacsat_analysis.R`: merging, activity, effort.
+5. `3_data_submission.R`: Annex 1 (VE) and Annex 2 (LE) tables in `Results/`.
+
+Required packages for the conversion: `fst`, `data.table`.
+
+```{r session}
+cat("R:", R.version.string, "\n")
+```
